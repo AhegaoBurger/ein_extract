@@ -1,0 +1,18 @@
+[project]
+name = "ein-extract"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.13.4",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.1",
+    "pdfplumber>=0.11.7",
+    "requests>=2.32.4",
+    "tldextract>=5.3.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
