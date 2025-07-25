@@ -12,13 +12,15 @@ from collections import defaultdict
 import re
 from pathlib import Path
 import io
+from typing import Optional
+
 
 # Only run the app when using streamlit run
 if __name__ == "__main__":
     # Check if running with streamlit
     try:
         # This will only work when running with streamlit
-        _ = st.runtime.exists()
+        st.get_option("server.port")
     except:
         print("\n⚠️  Please run this app using streamlit:")
         print("    uv run streamlit run main.py")
@@ -59,16 +61,26 @@ def extract_hyperlinks_pypdf2(pdf_file):
             if '/Annots' in page:
                 annotations = page['/Annots']
                 # Handle the case where annotations might not be iterable
-                if hasattr(annotations, '__iter__'):
+                try:
+                    # Handle both direct list and indirect object references
+                    if hasattr(annotations, 'get_object'):
+                        annotations = annotations.get_object()
+
+                    # Convert to list if it's not already
+                    if not isinstance(annotations, list):
+                        continue
+
                     for annotation_ref in annotations:
                         try:
-                            annotation = annotation_ref.get_object()
-                            if annotation.get('/Subtype') == '/Link':
+                            annotation = annotation_ref.get_object() if hasattr(annotation_ref, 'get_object') else annotation_ref
+                            if annotation and annotation.get('/Subtype') == '/Link':
                                 if '/A' in annotation and '/URI' in annotation['/A']:
                                     url = annotation['/A']['/URI']
                                     page_urls[page_num].append(url)
                         except:
                             continue
+                except:
+                    continue
     except Exception as e:
         st.warning(f"Could not extract hyperlinks with PyPDF2: {e}")
 
@@ -93,6 +105,51 @@ def extract_hyperlinks_pdfplumber(pdf_file):
         st.warning(f"Could not extract hyperlinks with pdfplumber: {e}")
 
     return page_hyperlinks
+
+def _get_unique_urls_for_page(hyperlinks_pypdf2, hyperlinks_pdfplumber, page_num):
+    """Get unique URLs for a specific page"""
+    page_links_pypdf2 = hyperlinks_pypdf2.get(page_num, [])
+    page_links_pdfplumber = hyperlinks_pdfplumber.get(page_num, [])
+
+    # Combine URLs
+    all_page_urls = list(page_links_pypdf2)
+    all_page_urls.extend([link['url'] for link in page_links_pdfplumber])
+
+    # Remove duplicates
+    seen_urls = set()
+    unique_urls = []
+    for url in all_page_urls:
+        if url not in seen_urls and not url.startswith('mailto:'):
+            seen_urls.add(url)
+            unique_urls.append(url)
+
+    return unique_urls
+
+def _should_skip_line(line, skip_phrases):
+    """Check if a line should be skipped based on various criteria"""
+    if not line or any(skip.lower() in line.lower() for skip in skip_phrases):
+        return True
+
+    if (len(line) > 60 or line.count(' ') > 8 or
+        any(char in line for char in ['@', '%', '&amp;', '...', '|']) or
+        line.startswith('(') or line.startswith('http')):
+        return True
+
+    upper_count = sum(1 for c in line if c.isupper())
+    if upper_count < 2:
+        return True
+
+    return False
+
+def _is_media_outlet(line):
+    """Check if a line represents a media outlet"""
+    tv_pattern = r'^[A-Z]{3,5}\s+(?:ABC|NBC|CBS|FOX|CW|MyNetworkTV)\s*\d*'
+    media_pattern = r'^[A-Z][A-Za-z\s\-&\.\']+(?:\s+(?:News|Times|Journal|Post|Daily|Weekly|Today|Online|Report|Observer|Press|Media|Review|Update|Herald|Gazette|Tribune|Monitor))*$'
+    caps_pattern = r'^[A-Z\s\-]+$'
+
+    return (re.match(tv_pattern, line) or
+            re.match(media_pattern, line) or
+            (re.match(caps_pattern, line) and len(line) < 40))
 
 def extract_media_reprints_with_urls(pdf_file):
     """Extract media outlet names and URLs"""
@@ -131,21 +188,7 @@ def extract_media_reprints_with_urls(pdf_file):
                 if not text:
                     continue
 
-                # Get hyperlinks for this page
-                page_links_pypdf2 = hyperlinks_pypdf2.get(page_num, [])
-                page_links_pdfplumber = hyperlinks_pdfplumber.get(page_num, [])
-
-                # Combine URLs
-                all_page_urls = list(page_links_pypdf2)
-                all_page_urls.extend([link['url'] for link in page_links_pdfplumber])
-
-                # Remove duplicates
-                seen_urls = set()
-                unique_urls = []
-                for url in all_page_urls:
-                    if url not in seen_urls and not url.startswith('mailto:'):
-                        seen_urls.add(url)
-                        unique_urls.append(url)
+                unique_urls = _get_unique_urls_for_page(hyperlinks_pypdf2, hyperlinks_pdfplumber, page_num)
 
                 # Check section
                 if 'Media Reprints:' in text:
@@ -166,27 +209,10 @@ def extract_media_reprints_with_urls(pdf_file):
                 for line in lines:
                     line = line.strip()
 
-                    if not line or any(skip.lower() in line.lower() for skip in skip_phrases):
+                    if _should_skip_line(line, skip_phrases):
                         continue
 
-                    if (len(line) > 60 or line.count(' ') > 8 or
-                        any(char in line for char in ['@', '%', '&amp;', '...', '|']) or
-                        line.startswith('(') or line.startswith('http')):
-                        continue
-
-                    upper_count = sum(1 for c in line if c.isupper())
-                    if upper_count < 2:
-                        continue
-
-                    # Media outlet patterns
-                    tv_pattern = r'^[A-Z]{3,5}\s+(?:ABC|NBC|CBS|FOX|CW|MyNetworkTV)\s*\d*'
-                    media_pattern = r'^[A-Z][A-Za-z\s\-&\.\']+(?:\s+(?:News|Times|Journal|Post|Daily|Weekly|Today|Online|Report|Observer|Press|Media|Review|Update|Herald|Gazette|Tribune|Monitor))*$'
-                    caps_pattern = r'^[A-Z\s\-]+$'
-
-                    if (re.match(tv_pattern, line) or
-                        re.match(media_pattern, line) or
-                        (re.match(caps_pattern, line) and len(line) < 40)):
-
+                    if _is_media_outlet(line):
                         agency = line.strip()
 
                         if agency in seen_agencies:
@@ -207,32 +233,91 @@ def extract_media_reprints_with_urls(pdf_file):
 
     return results
 
-def create_excel_download(data):
-    """Create Excel file and return as bytes"""
-    output = io.BytesIO()
+class ExcelBuffer:
+    """Custom buffer that implements WriteExcelBuffer protocol for pandas.
+
+    This class wraps io.BytesIO and adds the necessary methods and properties
+    to satisfy pandas' WriteExcelBuffer protocol requirements.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = io.BytesIO()
+
+    def write(self, data: bytes) -> int:
+        """Write bytes to the buffer."""
+        return self._buffer.write(data)
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        """Change stream position."""
+        return self._buffer.seek(pos, whence)
+
+    def tell(self) -> int:
+        """Return current stream position."""
+        return self._buffer.tell()
+
+    def read(self, size: int = -1) -> bytes:
+        """Read and return bytes from the buffer."""
+        return self._buffer.read(size)
+
+    def truncate(self, size: Optional[int] = None) -> int:
+        """Truncate the buffer to at most size bytes."""
+        return self._buffer.truncate(size)
+
+    def flush(self) -> None:
+        """Flush write buffers."""
+        return self._buffer.flush()
+
+    def seekable(self) -> bool:
+        """Return whether object supports random access."""
+        return self._buffer.seekable()
+
+    @property
+    def mode(self) -> str:
+        """Return the buffer mode."""
+        return 'wb'
+
+    def getvalue(self) -> bytes:
+        """Return the entire contents of the buffer."""
+        return self._buffer.getvalue()
+
+    def close(self) -> None:
+        """Close the buffer."""
+        return self._buffer.close()
+
+def create_excel_download(data: list[tuple[str, str]]) -> bytes:
+    """Create Excel file and return as bytes.
+
+    Args:
+        data: List of tuples containing (agency_name, url) pairs
+
+    Returns:
+        Excel file content as bytes
+    """
+    output = ExcelBuffer()
 
     # Create DataFrame from list of tuples
-    df = pd.DataFrame(data, columns=['Agency', 'URL'])
+    df = pd.DataFrame(data)
+    df.columns = ['Agency', 'URL']
 
-    # Create Excel writer with the BytesIO buffer
-    with pd.ExcelWriter(output, engine='openpyxl', mode='w') as writer:
+    # Create Excel writer with the custom buffer
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    try:
         df.to_excel(writer, index=False, sheet_name='Media Outlets')
 
-        # Get the workbook and worksheet
-        workbook = writer.book
+        # Get the worksheet for xlsxwriter
         worksheet = writer.sheets['Media Outlets']
 
         # Adjust column widths
-        worksheet.column_dimensions['A'].width = 40
-        worksheet.column_dimensions['B'].width = 80
+        worksheet.set_column('A:A', 40)
+        worksheet.set_column('B:B', 80)
 
-        # Add hyperlinks
-        for idx, row in enumerate(df.values, start=2):
+        # Add hyperlinks using xlsxwriter format
+        for idx, row in enumerate(df.values, start=1):  # xlsxwriter uses 0-based indexing
             agency, url = row
             if url and url.startswith('http'):
-                cell = worksheet.cell(row=idx, column=2)
-                cell.hyperlink = url
-                cell.style = 'Hyperlink'
+                worksheet.write_url(idx, 1, url, string=url)
+    finally:
+        writer.close()
 
     # Get the Excel file bytes
     output.seek(0)
@@ -269,7 +354,7 @@ if 'conversion_results' in st.session_state:
     url_count = sum(1 for _, url in data if url != "URL_TBD")
 
     st.markdown("---")
-    st.success(f"✅ Conversion complete!")
+    st.success("✅ Conversion complete!")
 
     col1, col2, col3 = st.columns(3)
     with col1:
